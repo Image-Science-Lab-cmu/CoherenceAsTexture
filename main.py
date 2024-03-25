@@ -1,4 +1,3 @@
-import scipy.io
 import numpy as np
 import matplotlib.pyplot as plt
 import time
@@ -16,7 +15,6 @@ from holotorch.Spectra.SpacingContainer import SpacingContainer
 
 import copy
 import util
-import argparse
 
 import glob
 from PIL import Image
@@ -65,49 +63,39 @@ def sim_self_interference(
     shift_range = np.arange(-6,7),
     ds_ratio = 4,
     mag_ratio = 1,
-    device = torch.device("cuda:0")
+    device = torch.device("cuda:0"),
+    pathlength_mismatch = 0* um,
+    retroreflector_horizontal_position_mismatch = 0* um
 ):
 
-    sensor_type = 'shift_aperture' # 'tilt_camera' or 'shift_aperture'
+    print(f"coherence size ={coherence_size},  aperture D ratio ={aperture_D_ratio}, camera_view_angle={camera_view_angle}, light_angle_spread = {light_angle_spread_deg}, depth_step={depth_scan_step}, dsratio ={ds_ratio}")
 
-    aperture_D = Nx * aperture_D_ratio
-
-    # non ideal sim
-    sim_nonideal = False
-    depth_mismatch = 0* um
-    shift_mismatch = 0* um
-
-    print(f"coherence size ={coherence_size},  aperture D ratio ={aperture_D_ratio}, camera_view_angle={camera_view_angle}, light_angle_spread = {light_angle_spread_deg}, sensor_type ={sensor_type}, depth_step={depth_scan_step}, dsratio ={ds_ratio}")
-
-    aperture_shift_pixel = int(np.round( math.tan(camera_view_angle * math.pi/ 180.0) * f / dfx  ))
-
-    if save_fig:
-        if not os.path.exists(output_path):
-            os.makedirs(output_path)
-
-
+    # World coordinate
     world_grid_x, world_grid_y = torch.meshgrid([torch.linspace(-Nx//2+1, Nx//2, steps=Nx),
                                         torch.linspace(-Ny//2+1, Ny//2, steps=Ny)],  indexing='xy')      
     world_grid_x = world_grid_x.to(device)                                         
     world_grid_y = world_grid_y.to(device)                                         
 
+    #Target: plane with random phase
+    original_target = torch.exp(1j*2*math.pi*torch.rand(Ny,Nx))
 
+    # Fourier transform lens
+    lens = FT_Lens(focal_length  = f)
+
+    # Built shifted aperture
+    aperture_shift_pixel = int(np.round( math.tan(camera_view_angle * math.pi/ 180.0) * f / dfx  ))
     R = torch.sqrt((world_grid_x+aperture_shift_pixel)**2 + world_grid_y**2) # shift the aperture to the right
-
+    aperture_D = Nx * aperture_D_ratio
     aperture_binary = SimpleMask()
     aperture_binary.mask = torch.unsqueeze(torch.unsqueeze((R <aperture_D/2).float(),0),1).to(device)
 
-    R0 = torch.sqrt(world_grid_x**2 + world_grid_y**2)
+    # 4f system with shifted aperture
+    tilt_ortho_camera_path = [lens, aperture_binary, lens]
 
-    aperture_circ = SimpleMask()
+    # Phasors on LC cell
+    LC_cell_phasors = torch.exp( torch.asarray([0,2/3,4/3])*1j* torch.pi).to(device) # three phasors for PSI
 
-    FFT2 = lambda sig:  torch.fft.fftshift(torch.fft.fft2(torch.fft.fftshift(sig)))
-
-    aperture_circ.mask = torch.unsqueeze(torch.unsqueeze( FFT2( (R0< 1/aperture_D_ratio).float() ),0),1)
-
-    lens1 = FT_Lens(focal_length  = f)
-    phasors = torch.exp( torch.asarray([0,2/3,4/3])*1j* torch.pi).to(device)
-
+    # Simulate magnification if ratio != 1
     if mag_ratio != 1:
         p = f*(1+1/mag_ratio)
         q = f*(mag_ratio+1)
@@ -120,13 +108,19 @@ def sim_self_interference(
 
         mag_path = [lens_p, asm_prop_mag, lens_q]
 
+    # Simulate non-ideal factor
+    sim_nonideal =  pathlength_mismatch != 0 or retroreflector_horizontal_position_mismatch != 0 # simulate displacement of retroreflector or not
+
+
+    # Initialize values to record
     Cx = int(np.ceil(Nx/ds_ratio))
     Cy = int(np.ceil(Ny/ds_ratio))
     dc_all = np.zeros((Cy, Cx, len(shift_range)))    
     interf_all = np.zeros((Cy, Cx, len(shift_range)))    
     contrast_all = np.zeros((Cy, Cx, len(shift_range)))    
-
-    original_target = torch.exp(1j*2*math.pi*torch.rand(Ny,Nx))
+    if save_fig:
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
 
     with torch.no_grad():
         for physical_shift_id, physical_shift in enumerate(shift_range):
@@ -136,37 +130,34 @@ def sim_self_interference(
 
             print(f'shift = {physical_shift}')
 
-            # resample phase to avoid memory effect-like phenomena
-
             asm_prop = ASM_Prop(
                 init_distance = -physical_shift*depth_scan_step,
             )
 
-            path = [lens1, aperture_binary, lens1]
-
             if sim_nonideal:
                 asm_prop_nonideal = ASM_Prop(
-                    init_distance = -physical_shift*depth_scan_step +  depth_mismatch,
+                    init_distance = -physical_shift*depth_scan_step +  pathlength_mismatch,
                 )
-
-                nonideal_ramp_freq = shift_mismatch/dx/Nx
+                nonideal_ramp_freq = retroreflector_horizontal_position_mismatch/dx/Nx
                 nonideal_ramp = SimpleMask()
                 nonideal_ramp.mask = torch.exp(1j * 2* torch.pi * world_grid_x* nonideal_ramp_freq)
 
 
-            n_cbatch_x = int(np.round(n_points_x/wave_sample_interval))
-            n_cbatch_y = int(np.round(n_points_y/wave_sample_interval))
+            # blocks of waves
+            # n_cbatch_x = int(np.round(n_points_x/wave_sample_interval))
+            # n_cbatch_y = int(np.round(n_points_y/wave_sample_interval))
 
+            # simulate propagation of wave blocks one by one
+            #for pos_x in np.arange(-n_cbatch_x/2,n_cbatch_x/2)*wave_sample_interval:
+            #    for pos_y in np.arange(-n_cbatch_y/2,n_cbatch_y/2)*wave_sample_interval:
 
-            for pos_x in np.arange(-n_cbatch_x/2,n_cbatch_x/2)*wave_sample_interval:
-                for pos_y in np.arange(-n_cbatch_y/2,n_cbatch_y/2)*wave_sample_interval:
+            # simulate propagation of wave blocks one by one
+            for pos_x in np.arange(-n_points_x/2,n_points_x/2, wave_sample_interval):
+                for pos_y in np.arange(-n_points_y/2,n_points_y/2, wave_sample_interval):
 
-                    fields = torch.zeros(2,1,1,1,Ny,Nx)+0j  # two paths, note +0j is important as it set the type to complex
-                    fields = fields.to(device)
-
-                    original_wave = torch.zeros(Ny,Nx)+0j
+                    # one wave contain one coherent region
+                    original_wave = torch.zeros(Ny,Nx)+0j # note +0j is important as it set the type to complex
                     original_wave = original_wave.to(device)
-
     
                     original_wave[
                         int(Ny/2-coherence_size/2+pos_y):int(Ny/2+coherence_size/2+pos_y), 
@@ -175,8 +166,12 @@ def sim_self_interference(
                         int(Ny/2-coherence_size/2+pos_y):int(Ny/2+coherence_size/2+pos_y), 
                         int(Nx/2-coherence_size/2+pos_x):int(Nx/2+coherence_size/2+pos_x)
                     ]
-
                     original_wave = torch.reshape(original_wave,(1,1,1,1,Ny,Nx))
+
+
+                    # Record waves from two paths
+                    modulated_waves = torch.zeros(2,1,1,1,Ny,Nx)+0j  
+                    modulated_waves = modulated_waves.to(device)
 
                     for path_id in range(2):
                         waveprop = ElectricField(
@@ -187,39 +182,42 @@ def sim_self_interference(
                         waveprop.wavelengths=waveprop.wavelengths.to(device)
                         waveprop.spacing = waveprop.spacing.to(device)
 
-                        # propogate points with optional mismatch
+                        # propogate target to plane in focus
                         if sim_nonideal and path_id == 1:
+                            # optionally simulate pathlength mismatch
                             waveprop = asm_prop_nonideal(waveprop)
                         else:
                             waveprop = asm_prop(waveprop)
 
-                        # optionally magnification
+                        # optional magnification
                         if mag_ratio !=1:
                             for component in mag_path:
                                 waveprop = component(waveprop)
                             waveprop.data = util.mag_wave(waveprop.data, mag_ratio=mag_ratio)
                             waveprop.spacing = SpacingContainer(dx)
 
-                        # flip with optional additional phase ramp
+                        # horizontally flip the wave for one path
                         if path_id == 1:
                             waveprop.data = torch.flip(waveprop.data, dims=[5])
                             
+                        # optionally simulate retroreflector horizontal position mismatch
                         if sim_nonideal and path_id == 1:
                             waveprop = nonideal_ramp(waveprop)
                     
-                        # prop main path
-                        for component in path:
+                        # propagte over the 4f system with shifted aperture
+                        for component in tilt_ortho_camera_path:
                             waveprop = component(waveprop)
 
+                        # record
+                        modulated_waves[[path_id]] += waveprop.data.detach()
 
-                        fields[[path_id]] += waveprop.data.detach()
-
+                    # phase shifting interferometry
                     obs_interf = torch.cat( 
                         [   
                             torch.square( 
                                 (   
-                                    fields[[0]]+
-                                    phasors[phasor_id]*fields[[1]]
+                                    modulated_waves[[0]]+
+                                    LC_cell_phasors[phasor_id]*modulated_waves[[1]]
                                 ).abs()
                             ).detach() 
                             for phasor_id in range(3)
@@ -232,7 +230,7 @@ def sim_self_interference(
                     if pos_x == 0 and pos_y == 0:
                         print("torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated(0)/1024/1024/1024))
 
-                    del original_wave, waveprop, fields, obs_interf
+                    del original_wave, waveprop, modulated_waves, obs_interf
             
             print('observation before downsampling in camera')
 
@@ -266,7 +264,6 @@ def sim_self_interference(
             
                 plt.tight_layout()
                 plt.savefig(f'{output_path}/obs_{physical_shift_id}.png')
-                plt.show()
 
             print('dc and interf')
             dc_points_sum.data = torch.sum(
@@ -274,7 +271,7 @@ def sim_self_interference(
             ).detach()/3
 
             interf_points_sum.data = torch.sum(
-                obs_points_sum.data* phasors[None,:,None,None,None,None],
+                obs_points_sum.data* LC_cell_phasors[None,:,None,None,None,None],
                 dim=1,keepdim=True
             ).detach()/3
 
@@ -290,7 +287,6 @@ def sim_self_interference(
 
                 plt.tight_layout()
                 plt.savefig(f'{output_path}/dcinterf_{physical_shift_id}.png')
-                plt.show()
 
             # filtered out points has low intensity/ interfernce signal
             contrast = IntensityField(2*interf_points_sum.data/dc_points_sum.data *(dc_points_sum.data>0.1*(torch.max(dc_points_sum.data))) ) 
@@ -300,8 +296,6 @@ def sim_self_interference(
                 plt.tight_layout()
                 contrast[..., 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1,title = "contrast", flag_axis= True, vmax=1, vmin=0)
                 plt.savefig(f'{output_path}/contrast_{physical_shift_id}.png')
-
-                plt.show()
 
             dc_all[:,:,physical_shift_id] = dc_points_sum[0,0,0,0, 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().data.squeeze().detach().cpu().numpy()
             interf_all[:,:,physical_shift_id] = interf_points_sum[0,0,0,0, 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().data.squeeze().detach().cpu().numpy()
@@ -320,12 +314,6 @@ def sim_self_interference(
     return dc_all, interf_all
 
 if __name__ == '__main__':
-    # parser = argparse.ArgumentParser()
-    # parser.add_argument('--dratio', help='diameter ratio', type=float, default=0.25)
-    # parser.add_argument('--csize', help='coherence size', type=int, default=4)
-
-    # args = parser.parse_args()
-
     # do one more time for camera 1 um
     device = torch.device("cuda:1")
     coherence_length = 16*um # see \detla_c in the paper
@@ -353,10 +341,9 @@ if __name__ == '__main__':
     depth_scan_step = 5* diffraction_blur_kernel/um*coherence_length/mag_ratio/8 #um
     #depth_scan_step =  depth_scan_step*2  #7/30 temporaly double the depth scan step
 
-    shift_range = np.arange(-8,9,2)#np.arange(-8,9)#np.arange(-8,9)
-    #shift_range = np.arange(0,-9,-2)#np.arange(-8,9)#np.arange(-8,9)
+    #shift_range = np.arange(-8,9,2)#
+    shift_range = np.arange(0,-9,-2)
 
-    #ds_ratio = 4
     n_runs = 1
 
     Cx = int(np.ceil(Ny/ds_ratio))
