@@ -54,21 +54,18 @@ def draw_gif(
 
 def sim_self_interference(
     output_path,
-    aperture_D_ratio = 0.25,
-    coherence_size  = 64, # coherent world pixel
+    coherence_size = 64, # coherent world pixel
+    aperture_D_size = 250,
+    camera_ds_ratio = 3,
     wave_sample_interval = 8,
-    light_angle_spread_deg = 0, #degree
     camera_view_angle = 15,
-    depth_scan_step = 40/3*um,
-    shift_range = np.arange(-6,7),
-    ds_ratio = 4,
     mag_ratio = 1,
+    depth_scan_step = 160/3*um,
+    depth_scan_range = np.arange(-3,3.01),
     device = torch.device("cuda:0"),
     pathlength_mismatch = 0* um,
     retroreflector_horizontal_position_mismatch = 0* um
 ):
-
-    print(f"coherence size ={coherence_size},  aperture D ratio ={aperture_D_ratio}, camera_view_angle={camera_view_angle}, light_angle_spread = {light_angle_spread_deg}, depth_step={depth_scan_step}, dsratio ={ds_ratio}")
 
     # World coordinate
     world_grid_x, world_grid_y = torch.meshgrid([torch.linspace(-Nx//2+1, Nx//2, steps=Nx),
@@ -76,7 +73,7 @@ def sim_self_interference(
     world_grid_x = world_grid_x.to(device)                                         
     world_grid_y = world_grid_y.to(device)                                         
 
-    #Target: plane with random phase
+    # Target: plane with random phase
     original_target = torch.exp(1j*2*math.pi*torch.rand(Ny,Nx))
 
     # Fourier transform lens
@@ -85,9 +82,8 @@ def sim_self_interference(
     # Built shifted aperture
     aperture_shift_pixel = int(np.round( math.tan(camera_view_angle * math.pi/ 180.0) * f / dfx  ))
     R = torch.sqrt((world_grid_x+aperture_shift_pixel)**2 + world_grid_y**2) # shift the aperture to the right
-    aperture_D = Nx * aperture_D_ratio
     aperture_binary = SimpleMask()
-    aperture_binary.mask = torch.unsqueeze(torch.unsqueeze((R <aperture_D/2).float(),0),1).to(device)
+    aperture_binary.mask = torch.unsqueeze(torch.unsqueeze((R <aperture_D_size/2).float(),0),1).to(device)
 
     # 4f system with shifted aperture
     tilt_ortho_camera_path = [lens, aperture_binary, lens]
@@ -111,45 +107,36 @@ def sim_self_interference(
     # Simulate non-ideal factor
     sim_nonideal =  pathlength_mismatch != 0 or retroreflector_horizontal_position_mismatch != 0 # simulate displacement of retroreflector or not
 
-
     # Initialize values to record
-    Cx = int(np.ceil(Nx/ds_ratio))
-    Cy = int(np.ceil(Ny/ds_ratio))
-    dc_all = np.zeros((Cy, Cx, len(shift_range)))    
-    interf_all = np.zeros((Cy, Cx, len(shift_range)))    
-    contrast_all = np.zeros((Cy, Cx, len(shift_range)))    
+    Cx = int(np.ceil(Nx/camera_ds_ratio))
+    Cy = int(np.ceil(Ny/camera_ds_ratio))
+    dc_all = np.zeros((Cy, Cx, len(depth_scan_range)))    
+    interf_all = np.zeros((Cy, Cx, len(depth_scan_range)))    
+    contrast_all = np.zeros((Cy, Cx, len(depth_scan_range)))    
     if save_fig:
         if not os.path.exists(output_path):
             os.makedirs(output_path)
 
+    # Propagate waves
     with torch.no_grad():
-        for physical_shift_id, physical_shift in enumerate(shift_range):
+        for depth_scan_id, depth_scan in enumerate(depth_scan_range):
             obs_points_sum = IntensityField(torch.zeros(1,3,1,1,Ny,Nx).to(device)) # three phasors
             dc_points_sum = IntensityField(torch.zeros(1,1,1,1,Ny,Nx).to(device))
             interf_points_sum = IntensityField(torch.zeros(1,1,1,1,Ny,Nx).to(device))
 
-            print(f'shift = {physical_shift}')
+            print(f'scan {depth_scan_id}, depth = {depth_scan*depth_scan_step/um} um')
 
             asm_prop = ASM_Prop(
-                init_distance = -physical_shift*depth_scan_step,
+                init_distance = -depth_scan*depth_scan_step,
             )
 
             if sim_nonideal:
                 asm_prop_nonideal = ASM_Prop(
-                    init_distance = -physical_shift*depth_scan_step +  pathlength_mismatch,
+                    init_distance = -depth_scan*depth_scan_step +  pathlength_mismatch,
                 )
                 nonideal_ramp_freq = retroreflector_horizontal_position_mismatch/dx/Nx
                 nonideal_ramp = SimpleMask()
                 nonideal_ramp.mask = torch.exp(1j * 2* torch.pi * world_grid_x* nonideal_ramp_freq)
-
-
-            # blocks of waves
-            # n_cbatch_x = int(np.round(n_points_x/wave_sample_interval))
-            # n_cbatch_y = int(np.round(n_points_y/wave_sample_interval))
-
-            # simulate propagation of wave blocks one by one
-            #for pos_x in np.arange(-n_cbatch_x/2,n_cbatch_x/2)*wave_sample_interval:
-            #    for pos_y in np.arange(-n_cbatch_y/2,n_cbatch_y/2)*wave_sample_interval:
 
             # simulate propagation of wave blocks one by one
             for pos_x in np.arange(-n_points_x/2,n_points_x/2, wave_sample_interval):
@@ -182,7 +169,7 @@ def sim_self_interference(
                         waveprop.wavelengths=waveprop.wavelengths.to(device)
                         waveprop.spacing = waveprop.spacing.to(device)
 
-                        # propogate target to plane in focus
+                        # propogate target to plane in focus of the 4f system
                         if sim_nonideal and path_id == 1:
                             # optionally simulate pathlength mismatch
                             waveprop = asm_prop_nonideal(waveprop)
@@ -248,7 +235,7 @@ def sim_self_interference(
 
             print('observation after downsampling in camera') 
 
-            average_kernel = torch.ones(3,1,int(ds_ratio),int(ds_ratio)).to(device)/ds_ratio**2
+            average_kernel = torch.ones(3,1,int(camera_ds_ratio),int(camera_ds_ratio)).to(device)/camera_ds_ratio**2
             # average, also, change dim from [1,3,1,1,N,N] to [3,N,N]
             obs_points_sum.data= torch.nn.functional.conv2d(obs_points_sum.data[:,:,0,0,:,:],average_kernel,groups=3,padding='same')
             obs_points_sum.data= obs_points_sum.data[:,:,None,None,:,:]
@@ -256,14 +243,14 @@ def sim_self_interference(
             if save_fig:
                 plt.figure(figsize=(15,5))
                 plt.subplot(131)
-                obs_points_sum[:, 0,..., 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1, title = "|u + v|^2", flag_axis= True)
+                obs_points_sum[:, 0,..., 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().visualize(rescale_factor=1, title = "|u + v|^2", flag_axis= True)
                 plt.subplot(132)
-                obs_points_sum[:, 1,..., 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1,title = "|u + e^(2j pi/3)v|^2", flag_axis= True)
+                obs_points_sum[:, 1,..., 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().visualize(rescale_factor=1,title = "|u + e^(2j pi/3)v|^2", flag_axis= True)
                 plt.subplot(133)
-                obs_points_sum[:, 2,..., 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1,title = "|u + e^(4j pi/3)v|^2", flag_axis= True)
+                obs_points_sum[:, 2,..., 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().visualize(rescale_factor=1,title = "|u + e^(4j pi/3)v|^2", flag_axis= True)
             
                 plt.tight_layout()
-                plt.savefig(f'{output_path}/obs_{physical_shift_id}.png')
+                plt.savefig(f'{output_path}/obs_{depth_scan_id}.png')
 
             print('dc and interf')
             dc_points_sum.data = torch.sum(
@@ -278,15 +265,15 @@ def sim_self_interference(
             if save_fig:
                 plt.figure(figsize=(15,5))
                 plt.subplot(131)
-                dc_points_sum[..., 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1,title = "dc", flag_axis= True)
+                dc_points_sum[..., 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().visualize(rescale_factor=1,title = "dc", flag_axis= True)
                 plt.subplot(132)
-                interf_points_sum[...,0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1,title = "interf abs", flag_axis= True)
+                interf_points_sum[...,0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().visualize(rescale_factor=1,title = "interf abs", flag_axis= True)
                 plt.subplot(133)
-                interf_points_sum[...,0:Ny:ds_ratio, 0:Nx:ds_ratio].angle().visualize(rescale_factor=1,title = "interf phase", flag_axis= True, cmap='binary_r')
+                interf_points_sum[...,0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].angle().visualize(rescale_factor=1,title = "interf phase", flag_axis= True, cmap='binary_r')
                 plt.hsv()
 
                 plt.tight_layout()
-                plt.savefig(f'{output_path}/dcinterf_{physical_shift_id}.png')
+                plt.savefig(f'{output_path}/dcinterf_{depth_scan_id}.png')
 
             # filtered out points has low intensity/ interfernce signal
             contrast = IntensityField(2*interf_points_sum.data/dc_points_sum.data *(dc_points_sum.data>0.1*(torch.max(dc_points_sum.data))) ) 
@@ -294,12 +281,12 @@ def sim_self_interference(
             if save_fig:
                 plt.figure(figsize=(5,5))
                 plt.tight_layout()
-                contrast[..., 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().visualize(rescale_factor=1,title = "contrast", flag_axis= True, vmax=1, vmin=0)
-                plt.savefig(f'{output_path}/contrast_{physical_shift_id}.png')
+                contrast[..., 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().visualize(rescale_factor=1,title = "contrast", flag_axis= True, vmax=1, vmin=0)
+                plt.savefig(f'{output_path}/contrast_{depth_scan_id}.png')
 
-            dc_all[:,:,physical_shift_id] = dc_points_sum[0,0,0,0, 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().data.squeeze().detach().cpu().numpy()
-            interf_all[:,:,physical_shift_id] = interf_points_sum[0,0,0,0, 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().data.squeeze().detach().cpu().numpy()
-            contrast_all[:,:,physical_shift_id] = contrast[0,0,0,0, 0:Ny:ds_ratio, 0:Nx:ds_ratio].abs().data.squeeze().detach().cpu().numpy()
+            dc_all[:,:,depth_scan_id] = dc_points_sum[0,0,0,0, 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().data.squeeze().detach().cpu().numpy()
+            interf_all[:,:,depth_scan_id] = interf_points_sum[0,0,0,0, 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().data.squeeze().detach().cpu().numpy()
+            contrast_all[:,:,depth_scan_id] = contrast[0,0,0,0, 0:Ny:camera_ds_ratio, 0:Nx:camera_ds_ratio].abs().data.squeeze().detach().cpu().numpy()
 
             del obs_points_sum, dc_points_sum, interf_points_sum
 
@@ -309,91 +296,92 @@ def sim_self_interference(
             np.save(file,dc_all)
             np.save(file,interf_all)
             np.save(file,contrast_all)
-            np.save(file,shift_range)
 
     return dc_all, interf_all
 
 if __name__ == '__main__':
-    # do one more time for camera 1 um
-    device = torch.device("cuda:1")
+    ## Setting parameters
+
+    device = torch.device("cuda:0")
     coherence_length = 16*um # see \detla_c in the paper
     diffraction_blur_kernel = 2*um  # see \detla_Phi in the paper
     camera_pitch = 0.75*um # see \detla_x in the paper
+    camera_view_angle = 15 # see atan(\beta) in the paper, effective tilt angle of the camera
+    mag_ratio = 1 # see M in the paper, fixed to be 1 in analysis
+    depth_scan_step = diffraction_blur_kernel/lam*coherence_length/mag_ratio # depth range will scale with these factors, see (14)
+    depth_scan_range = np.arange(-3,3.01,0.75)
 
-
+    # discretized parameters
     coherence_size = int(coherence_length//dx)
+    aperture_D_length = f*lam/diffraction_blur_kernel
+    aperture_D_size = aperture_D_length/dfx 
+    camera_ds_ratio = int(camera_pitch//dx)
 
-    #In real world, waves from different postions are partially coherent with others
-    #It can be simulated by multiple coherent blocks of waves overlapped with each other
-    #To simulate real world behavior precisely, sample interveral should be smaller than diffraction_blur_kernel//dx
-    #However, this dense sampling takes a long time to run
-    #For some quick evaluation, one can set wave_sample_interval = coherence_size, but it will has inprecised contrast value
+    # Set wave_sample_interval
+    # In real world, waves from different postions are partially coherent with others
+    # It can be simulated by multiple coherent blocks of waves overlapped with each other
+    # To simulate real world behavior precisely, sample interveral should be smaller than diffraction_blur_kernel//dx
+    # However, this dense sampling takes a long time to run
+    # For some quick evaluation, one can set wave_sample_interval = coherence_size, but it will has inprecise contrast value
 
     #wave_sample_interval = int(2*um//dx) #precised simulation used in the paper
     wave_sample_interval = coherence_size #quick evaluation
 
-    aperture_size = f*lam/diffraction_blur_kernel
-    aperture_D_ratio = aperture_size/Nx/dfx 
-    ds_ratio = int(camera_pitch//dx)
 
-    mag_ratio = 1 # simulate the magnification effects of scanning length, fixed to be one in analysis
-    camera_view_angle = 15
-    depth_scan_step = 5* diffraction_blur_kernel/um*coherence_length/mag_ratio/8 #um
-    #depth_scan_step =  depth_scan_step*2  #7/30 temporaly double the depth scan step
-
-    #shift_range = np.arange(-8,9,2)#
-    shift_range = np.arange(0,-9,-2)
-
-    n_runs = 1
-
-    Cx = int(np.ceil(Ny/ds_ratio))
-    H = int(np.ceil(n_points_y*dx/camera_pitch))
-
-    dc_all_epochs = np.zeros((n_runs* H, Cx, len(shift_range))) 
-    interf_all_epochs = np.zeros((n_runs* H, Cx, len(shift_range)))
-
+    ## Preparing saving data
 
     params_dict = {
         'object_pitch': dx,
         'wave_length': lam,
-        'aperture_size': aperture_size,
+        'aperture_D_length': aperture_D_length,
         'focal_length': f,
-        'numerical_aperture': f/aperture_size,
+        'numerical_aperture': f/aperture_D_length,
         'coherence_length': coherence_length, #coherence_size*dx,
-        'diffraction_blur_kernel': diffraction_blur_kernel, #f/aperture_size*lam,
-        'camera_pitch': camera_pitch, #dx* ds_ratio,
+        'diffraction_blur_kernel': diffraction_blur_kernel, #f/aperture_D_length*lam,
+        'camera_pitch': camera_pitch, #dx* camera_ds_ratio,
         'camera_view_angle': camera_view_angle,
-        'depth_step': depth_scan_step,
+        'depth_scan_step': depth_scan_step,
+        'depth_scan_range': depth_scan_range,
         'mag_ratio': mag_ratio,
         'wave_sample_interval': wave_sample_interval
     }
 
     ts = time.gmtime()
     timestamp = time.strftime("%Y-%m-%d_%H:%M:%S", ts)
-    output_path = f'./outputs/{timestamp}_vangle_{camera_view_angle}_magratio_{mag_ratio}_dstep_{np.round(depth_scan_step/um)}_c_{coherence_length//um}_b_{diffraction_blur_kernel//um}_p_{camera_pitch//um}'
 
+    print(f"coherence length ={coherence_length//um}um,  diffraction blur kernel size ={diffraction_blur_kernel//um}um, camera pixel pitch ={(camera_pitch/um):.2f}um,  camera_view_angle={camera_view_angle}, depth_step={depth_scan_step}, magnification_rate={mag_ratio}")
+    output_path = f'./outputs/{timestamp}_c_{coherence_length//um}_b_{diffraction_blur_kernel//um}_p_{(camera_pitch/um):.2f}_vangle_{camera_view_angle}_magratio_{mag_ratio}_dstep_{np.round(depth_scan_step/um)}'
     if save_data:
         if not os.path.exists(output_path):
             os.makedirs(output_path)
+
+
+    # Run simulation and save data
+
+    n_runs = 1
+    Cx = int(np.ceil(Ny/camera_ds_ratio))
+    H = int(np.ceil(n_points_y/camera_ds_ratio ))
+    dc_all_epochs = np.zeros((n_runs* H, Cx, len(depth_scan_range))) 
+    interf_all_epochs = np.zeros((n_runs* H, Cx, len(depth_scan_range)))
 
     for run in range(n_runs):
         print(f'run = {run}')
 
         dc_all, interf_all = sim_self_interference(
             output_path = output_path,
-            aperture_D_ratio=aperture_D_ratio,
             coherence_size=coherence_size, 
+            aperture_D_size = aperture_D_size,
+            camera_ds_ratio=camera_ds_ratio,
             wave_sample_interval=wave_sample_interval,
             camera_view_angle = camera_view_angle,
-            depth_scan_step = depth_scan_step,
-            shift_range = shift_range,
-            ds_ratio=ds_ratio,
             mag_ratio=mag_ratio,
+            depth_scan_step = depth_scan_step,
+            depth_scan_range = depth_scan_range,
             device = device
         )
 
-        dc_all_epochs[ H*run: H*run+ H, :, :] =  dc_all[(int(Ny/ds_ratio)//2) -H//2: (int(Ny/ds_ratio)//2) +(H-H//2),:,:]
-        interf_all_epochs[ H*run: H*run+ H, :, :] =  interf_all[ (int(Ny/ds_ratio)//2) -H//2: (int(Ny/ds_ratio)//2) +(H-H//2),:,:]
+        dc_all_epochs[ H*run: H*run+ H, :, :] =  dc_all[(int(Ny/camera_ds_ratio)//2) -H//2: (int(Ny/camera_ds_ratio)//2) +(H-H//2),:,:]
+        interf_all_epochs[ H*run: H*run+ H, :, :] =  interf_all[ (int(Ny/camera_ds_ratio)//2) -H//2: (int(Ny/camera_ds_ratio)//2) +(H-H//2),:,:]
 
 
     if save_data:
